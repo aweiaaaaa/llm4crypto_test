@@ -40,24 +40,44 @@ class MockLLMAnalyzer:
                 tokens.append(token)
         return tokens if tokens else ['BTC']
 
-    def _analyze_sentiment(self, text: str) -> str:
-        bullish_words = ['approve', 'approve', 'launch', 'increase', 'rise', 'bullish', 'up', 'positive', 'good', 'great', 'excellent', 'success', 'win', 'profit', 'gain']
-        bearish_words = ['reject', 'fail', 'decline', 'drop', 'bearish', 'down', 'negative', 'bad', 'loss', 'crash', 'sell', 'dump']
-        fear_words = ['fear', 'panic', 'risk', 'danger', 'warning', 'alert']
-        excited_words = ['excited', 'amazing', 'huge', 'massive', 'big', 'breakthrough']
-        
+    def _analyze_sentiment(self, text: str) -> Tuple[str, str, str]:
+        bullish_words = ['approve', 'launch', 'increase', 'rise', 'bullish', 'up', 'positive', 'good', 'great', 'excellent', 'success', 'win', 'profit', 'gain', 'surge', 'rally', 'breakout']
+        bearish_words = ['reject', 'fail', 'decline', 'drop', 'bearish', 'down', 'negative', 'bad', 'loss', 'crash', 'sell', 'dump', 'plunge', 'collapse']
+        fear_words = ['fear', 'panic', 'risk', 'danger', 'warning', 'alert', 'concern', 'uncertainty', 'crisis']
+        excited_words = ['excited', 'amazing', 'huge', 'massive', 'big', 'breakthrough', 'historic', 'explosive']
+        anticipation_words = ['expect', 'will', 'going', '预测', '预期', '可能']
+
         text_lower = text.lower()
-        
+
+        predictive = any(word in text_lower for word in anticipation_words + ['will', 'going', 'expect', 'predict', 'forecast'])
+
         if any(word in text_lower for word in excited_words):
-            return 'excited'
+            sentiment = 'excited'
+            emotion = 'JOY'
         elif any(word in text_lower for word in fear_words):
-            return 'fear'
+            sentiment = 'fear'
+            emotion = 'FEAR'
         elif any(word in text_lower for word in bullish_words):
-            return 'bullish'
+            sentiment = 'bullish'
+            emotion = 'JOY'
         elif any(word in text_lower for word in bearish_words):
-            return 'bearish'
+            sentiment = 'bearish'
+            emotion = 'ANGER'
         else:
-            return random.choice(['neutral', 'bullish', 'bearish'])
+            sentiment = random.choice(['neutral', 'bullish', 'bearish'])
+            emotion = random.choice(['TRUST', 'ANTICIPATION', 'SURPRISE'])
+
+        if predictive:
+            if sentiment in ['bullish', 'excited']:
+                direction = 'incremental'
+            elif sentiment in ['bearish', 'fear']:
+                direction = 'decremental'
+            else:
+                direction = 'neutral'
+        else:
+            direction = 'neutral'
+
+        return sentiment, emotion, direction
 
     def analyze_text(self, text: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
         if use_cache:
@@ -67,28 +87,60 @@ class MockLLMAnalyzer:
                 return self.cache[cache_key]
 
         tokens = self._extract_tokens(text)
-        sentiment = self._analyze_sentiment(text)
-        
+        sentiment, primary_emotion, predictive_direction = self._analyze_sentiment(text)
+
+        is_predictive = predictive_direction != 'neutral'
+
         importance = random.randint(3, 8)
         importance_reasons = [
             '涉及主流代币，市场关注度高',
             '信息来源可靠，影响较大',
             '可能引发短期市场波动',
             '涉及监管政策变化',
-            '与重大事件相关'
+            '与重大事件相关',
+            '包含价格预测成分',
+            '涉及技术突破或创新'
         ]
-        
+
+        emotion_explanations = {
+            'JOY': '表达积极情绪，对市场前景乐观',
+            'FEAR': '表达担忧和不确定性',
+            'ANGER': '表达对负面事件的不满',
+            'ANTICIPATION': '对即将发生的事件有预期',
+            'SADNESS': '表达失望或损失情绪',
+            'TRUST': '表达对信息源的信任',
+            'SURPRISE': '表达对意外事件的惊讶'
+        }
+
         is_relevant = True if tokens else False
-        
+
+        reasoning_chain = [
+            f"主要话题: 加密货币市场相关，提到 {', '.join(tokens) if tokens else '通用市场'}",
+            f"预测性判断: {'是' if is_predictive else '否'}，{'方向性预测' if predictive_direction != 'neutral' else '事实性陈述'}",
+            f"情绪分析: {primary_emotion} -> 市场情绪 {sentiment}",
+            f"综合评估: 重要性 {importance}/10，时间尺度 {random.choice(['short-term', 'medium-term', 'long-term'])}"
+        ]
+
+        if is_predictive:
+            market_impact = 'positive' if predictive_direction == 'incremental' else 'negative' if predictive_direction == 'decremental' else 'neutral'
+        else:
+            market_impact = 'neutral' if sentiment == 'neutral' else 'positive' if sentiment in ['bullish', 'excited'] else 'negative'
+
         analysis = {
+            'reasoning_chain': reasoning_chain,
+            'is_predictive': is_predictive,
+            'predictive_direction': predictive_direction if is_predictive else None,
             'relevant': is_relevant,
             'tokens': tokens,
             'sentiment': sentiment,
+            'primary_emotion': primary_emotion,
+            'emotion_explanation': emotion_explanations.get(primary_emotion, '市场情绪中性'),
             'time_scale': random.choice(['short-term', 'medium-term', 'long-term']),
             'importance': importance,
             'importance_reason': random.choice(importance_reasons),
             'is_market_relevant': is_relevant,
-            'summary': f"分析文本涉及{', '.join(tokens)}，情绪倾向为{sentiment}，重要性评分为{importance}分"
+            'market_impact': market_impact,
+            'summary': f"分析文本涉及{', '.join(tokens) if tokens else '市场整体'}，情绪倾向为{sentiment}，{'包含预测性陈述' if is_predictive else '属于事实性陈述'}，重要性评分为{importance}分。"
         }
 
         if use_cache:

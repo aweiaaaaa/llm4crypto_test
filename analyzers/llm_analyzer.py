@@ -57,65 +57,50 @@ class LLMAnalyzer:
 
     def _build_prompt(self, text: str) -> str:
         """
-        Enhanced prompt engineering based on crypto-sentiment-with-llms project
+        Optimized hybrid prompt combining:
+        - Simple direct sentiment approach (from old version)
+        - Two-stage predictive classification (arXiv:2603.24933)
+        - Chain-of-Thought reasoning (arXiv:2508.15825)
+        - SenticNet fine-grained emotions
         """
-        prompt = f"""
-        You are a cryptocurrency market analysis expert. Your task is to analyze the following text
-        and provide a structured analysis of its potential market impact.
+        prompt = f"""Analyze this cryptocurrency text and provide structured analysis.
 
-        TEXT TO ANALYZE:
-        {text}
+TEXT: {text}
 
-        OUTPUT FORMAT (JSON ONLY):
-        {{
-            "relevant": true/false,
-            "tokens": ["TOKEN1", "TOKEN2", ...],
-            "sentiment": "bullish" | "bearish" | "neutral" | "fear" | "excited",
-            "time_scale": "short-term" | "medium-term" | "long-term",
-            "importance": 1-10,
-            "importance_reason": "brief explanation of why this score was given",
-            "is_market_relevant": true/false,
-            "summary": "concise summary of the text's market impact"
-        }}
+## STEP 1: IS THIS POSITIVE OR NEGATIVE?
+Simply determine if the overall sentiment is positive or negative for crypto markets.
 
-        ANALYSIS GUIDELINES:
-        1. RELEVANCE: Determine if the text is directly related to cryptocurrency markets.
-           - True if it mentions specific crypto tokens, regulatory news, partnerships, etc.
-           - False if it's unrelated or spam content.
+## STEP 2: IS THIS PREDICTIVE?
+- PREDICTIVE = Claims about FUTURE prices (e.g., "BTC will reach $100k", "ETH to drop below $2k")
+- NON-PREDICTIVE = Current facts (e.g., "SEC approved ETF", "Binance listed token")
 
-        2. TOKENS: Extract all cryptocurrency symbols mentioned (e.g., BTC, ETH, SOL).
-           - Include both symbol format ($BTC) and plain symbols (BTC).
+## STEP 3: IF PREDICTIVE, WHAT DIRECTION?
+- INCREMENTAL = Price will GO UP (bullish words: reach, surge, rally, pump, jump, gain, climb, hit new high)
+- DECREMENTAL = Price will GO DOWN (bearish words: drop, crash, dump, fall, decline, plummet, lose, below)
 
-        3. SENTIMENT ANALYSIS:
-           - BULLISH: Positive news that could drive prices up (partnerships, adoption, positive regulatory news)
-           - BEARISH: Negative news that could drive prices down (security breaches, regulatory crackdowns)
-           - FEAR: News causing market fear/panic (exchange hacks, regulatory bans)
-           - EXCITED: Strongly positive news creating hype (major partnerships, product launches)
-           - NEUTRAL: News with no clear positive or negative impact
+## STEP 4: EMOTION (SenticNet)
+Choose primary emotion:
+- JOY: Positive news, success, gains
+- FEAR: Concerns, risks, warnings
+- ANGER: Failures, rejections, losses
+- ANTICIPATION: Expectations, upcoming events
 
-        4. TIME SCALE:
-           - SHORT-TERM: Impact expected within 1 week
-           - MEDIUM-TERM: Impact expected within 1-4 weeks
-           - LONG-TERM: Impact expected beyond 4 weeks
+## OUTPUT JSON:
+{{
+    "sentiment": "bullish/bearish/neutral",
+    "is_positive": true/false,
+    "is_predictive": true/false,
+    "predictive_direction": "incremental/decremental/neutral/null",
+    "tokens": ["TOKEN1"],
+    "primary_emotion": "JOY/FEAR/ANGER/ANTICIPATION",
+    "importance": 1-10,
+    "summary": "brief summary"
+}}
 
-        5. IMPORTANCE SCORING (1-10):
-           - 1-3: Low impact (minor updates, routine announcements)
-           - 4-6: Medium impact (significant news for specific projects)
-           - 7-8: High impact (major partnerships, regulatory decisions)
-           - 9-10: Very high impact (ETF approvals, major exchange listings, security breaches)
-
-        6. IMPORTANCE REASON: Provide a clear, concise reason for the importance score.
-
-        7. IS_MARKET_RELEVANT: Whether this news can realistically impact cryptocurrency prices.
-
-        8. SUMMARY: A brief summary (1-2 sentences) of what the news means for the market.
-
-        IMPORTANT: Output ONLY valid JSON. Do NOT include any preamble, explanation, or additional text.
-        """
+IMPORTANT: Output only valid JSON."""
         return prompt.strip()
 
     def analyze_text(self, text: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
-        # Use mock only when explicitly requested or when API is not configured
         if self.use_mock or not (self.api_key and self.base_url):
             if self.mock_analyzer:
                 return self.mock_analyzer.analyze_text(text, use_cache)
@@ -143,11 +128,11 @@ class LLMAnalyzer:
             data = {
                 'model': self.model,
                 'messages': [
-                    {"role": "system", "content": "You are a professional cryptocurrency market analyst specializing in sentiment analysis and market impact assessment."},
+                    {"role": "system", "content": "You are a professional cryptocurrency market analyst. Use Chain-of-Thought reasoning to analyze market sentiment and impact. Always output valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                'temperature': 0.2,
-                'max_tokens': 512,
+                'temperature': 0.3,
+                'max_tokens': 1024,
                 'response_format': {"type": "json_object"}
             }
 
@@ -159,11 +144,21 @@ class LLMAnalyzer:
             content = self._extract_json_from_response(content)
             analysis = json.loads(content)
 
+            if not isinstance(analysis, dict):
+                logger.error(f"Invalid analysis format: {type(analysis)}")
+                if self.mock_analyzer:
+                    return self.mock_analyzer.analyze_text(text, use_cache)
+                return None
+
+            if 'reasoning_chain' not in analysis:
+                analysis['reasoning_chain'] = ['Analysis completed']
+
             if use_cache:
                 cache_key = self._get_cache_key(text)
                 self.cache[cache_key] = analysis
                 self._save_cache()
 
+            logger.info(f"Analysis completed for text: {text[:50]}...")
             return analysis
 
         except json.JSONDecodeError as e:
@@ -208,24 +203,47 @@ class LLMAnalyzer:
 
         total = len(analysis_results)
         relevant = sum(1 for r in analysis_results if r.get('llm_analysis', {}).get('relevant', False))
-        
+
         sentiment_counts = {s: 0 for s in ['bullish', 'bearish', 'neutral', 'fear', 'excited']}
         importance_scores = []
         token_counts = {}
+
+        predictive_count = 0
+        incremental_count = 0
+        decremental_count = 0
+        emotion_counts = {e: 0 for e in ['JOY', 'FEAR', 'ANGER', 'ANTICIPATION', 'SADNESS', 'TRUST', 'SURPRISE']}
+        market_impact_counts = {'positive': 0, 'negative': 0, 'neutral': 0}
 
         for result in analysis_results:
             analysis = result.get('llm_analysis', {})
             sentiment = analysis.get('sentiment', 'neutral')
             if sentiment in sentiment_counts:
                 sentiment_counts[sentiment] += 1
-            
+
             importance = analysis.get('importance', 0)
             if isinstance(importance, int) and 1 <= importance <= 10:
                 importance_scores.append(importance)
-            
+
             tokens = analysis.get('tokens', [])
             for token in tokens:
                 token_counts[token] = token_counts.get(token, 0) + 1
+
+            is_predictive = analysis.get('is_predictive', False)
+            if is_predictive:
+                predictive_count += 1
+                direction = analysis.get('predictive_direction', 'neutral')
+                if direction == 'incremental':
+                    incremental_count += 1
+                elif direction == 'decremental':
+                    decremental_count += 1
+
+            primary_emotion = analysis.get('primary_emotion', 'TRUST')
+            if primary_emotion in emotion_counts:
+                emotion_counts[primary_emotion] += 1
+
+            market_impact = analysis.get('market_impact', 'neutral')
+            if market_impact in market_impact_counts:
+                market_impact_counts[market_impact] += 1
 
         avg_importance = sum(importance_scores) / len(importance_scores) if importance_scores else 0.0
         top_tokens = sorted(token_counts.keys(), key=lambda x: token_counts[x], reverse=True)[:10]
@@ -234,9 +252,13 @@ class LLMAnalyzer:
         Analysis Summary:
         - Total analyzed: {total}
         - Relevant: {relevant} ({(relevant/total)*100:.1f}%)
+        - Predictive statements: {predictive_count} ({predictive_count/total*100:.1f}%)
+          - Incremental: {incremental_count} | Decremental: {decremental_count}
         - Bullish/Excited: {sentiment_counts['bullish'] + sentiment_counts['excited']} ({((sentiment_counts['bullish'] + sentiment_counts['excited'])/total)*100:.1f}%)
         - Bearish/Fear: {sentiment_counts['bearish'] + sentiment_counts['fear']} ({((sentiment_counts['bearish'] + sentiment_counts['fear'])/total)*100:.1f}%)
         - Neutral: {sentiment_counts['neutral']} ({(sentiment_counts['neutral']/total)*100:.1f}%)
+        - Market Impact: Positive {market_impact_counts['positive']} | Negative {market_impact_counts['negative']} | Neutral {market_impact_counts['neutral']}
+        - Primary Emotions: Joy {emotion_counts['JOY']} | Fear {emotion_counts['FEAR']} | Anger {emotion_counts['ANGER']} | Anticipation {emotion_counts['ANTICIPATION']}
         - Average importance: {avg_importance:.2f}/10
         - Top tokens: {', '.join(top_tokens[:5])}
         """
@@ -257,8 +279,16 @@ class LLMAnalyzer:
 
         report_dict = summary.dict()
         report_dict['generated_at'] = summary.generated_at.isoformat()
+        report_dict['predictive_analysis'] = {
+            'predictive_count': predictive_count,
+            'incremental_count': incremental_count,
+            'decremental_count': decremental_count,
+            'predictive_rate': round(predictive_count / total * 100, 2) if total > 0 else 0
+        }
+        report_dict['emotion_distribution'] = emotion_counts
+        report_dict['market_impact_distribution'] = market_impact_counts
 
-        report_file = f"{Config.ANALYSIS_DIR}/analysis_report_{datetime.now(timezone.utc).strftime('%Y%m%d')}.json"
+        report_file = f"{Config.ANALYSIS_DIR}/analysis_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
         save_to_json(report_dict, report_file)
         logger.info(f"Analysis report saved to {report_file}")
 

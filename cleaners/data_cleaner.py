@@ -1,9 +1,15 @@
 import re
 import json
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Set
+import math
+import numpy as np
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import requests
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import check_random_state
 
 from configs.config import Config
 from utils.helpers import save_to_json, load_from_json, remove_duplicates, logger
@@ -13,6 +19,9 @@ class DataCleaner:
         self.token_keywords = set()
         self.token_aliases = {}
         self._load_token_list()
+        self.scaler = StandardScaler()
+        self.pca = None
+        self.price_kmeans = None
 
     def _load_token_list(self):
         try:
@@ -43,23 +52,19 @@ class DataCleaner:
         return len(cleaned.strip()) == 0
 
     def _is_advertisement(self, text: str) -> bool:
-        # 更精确的广告检测规则 - 需要多个广告特征同时出现
         ad_keywords_strong = ['giveaway', 'airdrop', 'promo', 'discount', 'guaranteed profit', 'guaranteed']
         ad_keywords_medium = ['free', 'claim now', 'click here', 'join now', 'limited offer', 'earn money', 'invest now']
         
         text_lower = text.lower()
         
-        # 强广告特征：出现任意一个即判定为广告
         for keyword in ad_keywords_strong:
             if keyword in text_lower:
                 return True
         
-        # 中等广告特征：需要至少 2 个不同特征才判定为广告
         medium_count = sum(1 for keyword in ad_keywords_medium if keyword in text_lower)
         if medium_count >= 2:
             return True
         
-        # 特殊情况：包含链接 + 强诱导性词汇
         if ('http' in text_lower or 't.co' in text_lower) and any(word in text_lower for word in ['free', 'win', 'claim']):
             return True
         
@@ -104,6 +109,66 @@ class DataCleaner:
         except Exception as e:
             logger.warning(f"Failed to parse timestamp {timestamp}: {e}")
         return timestamp
+
+    def _parse_timestamp(self, timestamp_str: str) -> datetime:
+        """解析时间戳为 datetime 对象"""
+        try:
+            if isinstance(timestamp_str, datetime):
+                return timestamp_str.replace(tzinfo=timezone.utc)
+            
+            if 'Z' in timestamp_str:
+                return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            elif '+' in timestamp_str:
+                return datetime.fromisoformat(timestamp_str)
+            else:
+                try:
+                    dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                    return dt.replace(tzinfo=timezone.utc)
+                except:
+                    try:
+                        dt = datetime.strptime(timestamp_str, '%Y-%m-%d')
+                        return dt.replace(tzinfo=timezone.utc)
+                    except:
+                        return datetime.now(timezone.utc)
+        except:
+            return datetime.now(timezone.utc)
+
+    def _time_decay_weight(self, timestamp: datetime, reference_time: datetime = None, half_life_hours: float = 24.0) -> float:
+        """
+        计算时间衰减权重（参考 Nature Scientific Reports 2026）
+        使用指数衰减：weight = exp(-λ * Δt)
+        其中 λ = ln(2) / half_life，确保半衰期后权重为 0.5
+        """
+        if reference_time is None:
+            reference_time = datetime.now(timezone.utc)
+        
+        delta_hours = (reference_time - timestamp).total_seconds() / 3600
+        
+        if delta_hours < 0:
+            return 1.0
+        
+        lambda_decay = math.log(2) / half_life_hours
+        weight = math.exp(-lambda_decay * delta_hours)
+        
+        return max(0.01, weight)
+
+    def _calculate_user_influence_score(self, followers: int = 0, engagement_rate: float = 0.0, retweets: int = 0, likes: int = 0) -> float:
+        """
+        计算用户影响力分数（参考 Nature Scientific Reports 2026）
+        影响力 = 粉丝数 × 互动率 × 内容质量因子
+        """
+        base_score = max(1, followers) * (1 + engagement_rate)
+        interaction_factor = math.log1p(retweets + likes)
+        
+        return base_score * interaction_factor
+
+    def _gaussian_noise_augmentation(self, features: np.ndarray, noise_std: float = 0.01, random_state: int = 42) -> np.ndarray:
+        """
+        添加高斯噪声增强鲁棒性（参考 Nature Scientific Reports 2026）
+        """
+        rng = check_random_state(random_state)
+        noise = rng.normal(0, noise_std, features.shape)
+        return features + noise
 
     def clean_twitter_data(self, raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         cleaned = []
@@ -345,6 +410,241 @@ class DataCleaner:
             'source_distribution': sources
         }
 
+    def advanced_feature_engineering(self, 
+                                     cleaned_data: List[Dict[str, Any]],
+                                     sentiment_probabilities: Optional[List[Dict[str, float]]] = None,
+                                     price_returns: Optional[List[float]] = None,
+                                     time_window_hours: int = 1,
+                                     half_life_hours: float = 24.0,
+                                     n_pca_components: int = 5,
+                                     n_clusters: int = 3) -> Tuple[List[Dict[str, Any]], np.ndarray, List[int]]:
+        """
+        高级特征工程（参考 Nature Scientific Reports 2026）
+        
+        核心方法：
+        1. 时间衰减加权情绪分数（时衰减）
+        2. 用户影响力加权（粉丝数 × 互动量）
+        3. PCA 降维聚合多特征
+        4. K-means 聚类定义价格剧烈波动标签
+        
+        Args:
+            cleaned_data: 清洗后的数据列表
+            sentiment_probabilities: 可选，RoBERTa 情绪概率列表 [{'positive': 0.8, 'negative': 0.2, 'neutral': 0.0}]
+            price_returns: 可选，后续回报率列表用于聚类
+            time_window_hours: 时间窗口大小（小时）
+            half_life_hours: 时间衰减半衰期（小时）
+            n_pca_components: PCA 组件数量
+            n_clusters: K-means 聚类数量
+            
+        Returns:
+            增强特征后的数据、PCA特征、价格标签
+        """
+        if not cleaned_data:
+            return [], np.array([]), []
+        
+        logger.info(f"Starting advanced feature engineering on {len(cleaned_data)} records")
+        
+        # 1. 准备特征矩阵
+        features = []
+        enhanced_data = []
+        
+        for i, item in enumerate(cleaned_data):
+            timestamp = self._parse_timestamp(item.get('timestamp', ''))
+            reference_time = timestamp  # 使用每条消息的时间作为参考
+            
+            # 基础特征
+            retweets = item.get('retweets', 0)
+            likes = item.get('likes', 0)
+            replies = item.get('replies', 0)
+            views = item.get('views', 0)
+            score = item.get('score', 0)
+            comments = item.get('comments', 0)
+            
+            # 计算互动指标
+            total_interaction = retweets + likes + replies + comments + views
+            engagement_rate = total_interaction / max(1, item.get('followers', 1)) if item.get('followers') else 0.0
+            
+            # 用户影响力分数
+            influence_score = self._calculate_user_influence_score(
+                followers=item.get('followers', 0),
+                engagement_rate=engagement_rate,
+                retweets=retweets,
+                likes=likes
+            )
+            
+            # 时间衰减权重
+            time_weight = self._time_decay_weight(timestamp, reference_time, half_life_hours)
+            
+            # 情绪概率（如果提供）
+            pos_prob = 0.5
+            neg_prob = 0.5
+            neu_prob = 0.0
+            if sentiment_probabilities and i < len(sentiment_probabilities):
+                pos_prob = sentiment_probabilities[i].get('positive', 0.5)
+                neg_prob = sentiment_probabilities[i].get('negative', 0.5)
+                neu_prob = sentiment_probabilities[i].get('neutral', 0.0)
+            
+            # 计算加权情绪分数
+            weighted_sentiment = (pos_prob - neg_prob) * time_weight * (1 + influence_score / 1000)
+            
+            # 构建特征向量
+            feature_vec = [
+                pos_prob,
+                neg_prob,
+                neu_prob,
+                influence_score,
+                time_weight,
+                weighted_sentiment,
+                retweets,
+                likes,
+                replies,
+                views,
+                score,
+                comments,
+                len(item.get('tokens', []))
+            ]
+            
+            features.append(feature_vec)
+            
+            # 增强数据记录
+            enhanced_data.append({
+                **item,
+                'influence_score': influence_score,
+                'time_weight': time_weight,
+                'sentiment_probabilities': {
+                    'positive': pos_prob,
+                    'negative': neg_prob,
+                    'neutral': neu_prob
+                },
+                'weighted_sentiment': weighted_sentiment,
+                'total_interaction': total_interaction,
+                'engagement_rate': engagement_rate
+            })
+        
+        # 2. 标准化特征
+        features_array = np.array(features)
+        features_scaled = self.scaler.fit_transform(features_array)
+        
+        # 3. 添加高斯噪声增强鲁棒性
+        features_noisy = self._gaussian_noise_augmentation(features_scaled, noise_std=0.01)
+        
+        # 4. PCA 降维
+        n_components = min(n_pca_components, features_noisy.shape[1])
+        self.pca = PCA(n_components=n_components, random_state=42)
+        pca_features = self.pca.fit_transform(features_noisy)
+        
+        logger.info(f"PCA explained variance ratio: {self.pca.explained_variance_ratio_}")
+        
+        # 5. K-means 聚类价格标签（如果提供了价格数据）
+        price_labels = []
+        if price_returns and len(price_returns) == len(cleaned_data):
+            returns_array = np.array(price_returns).reshape(-1, 1)
+            
+            # 添加高斯噪声到回报率数据
+            returns_noisy = self._gaussian_noise_augmentation(returns_array, noise_std=0.001)
+            
+            # K-means 聚类
+            self.price_kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+            price_labels = self.price_kmeans.fit_predict(returns_noisy)
+            
+            # 获取聚类中心并排序
+            cluster_centers = self.price_kmeans.cluster_centers_.flatten()
+            sorted_indices = np.argsort(cluster_centers)
+            
+            # 重新映射标签：0=下跌, 1=中性, 2=上涨（或更多类别）
+            label_mapping = {sorted_indices[i]: i for i in range(n_clusters)}
+            price_labels = [label_mapping[label] for label in price_labels]
+            
+            # 将价格标签添加到增强数据
+            for i, label in enumerate(price_labels):
+                if i < len(enhanced_data):
+                    enhanced_data[i]['price_movement_label'] = label
+            
+            logger.info(f"K-means price clusters: {np.bincount(price_labels)}")
+        else:
+            price_labels = [-1] * len(cleaned_data)
+        
+        # 将 PCA 特征添加到增强数据
+        for i, pca_vec in enumerate(pca_features):
+            if i < len(enhanced_data):
+                enhanced_data[i]['pca_features'] = pca_vec.tolist()
+        
+        logger.info(f"Advanced feature engineering completed")
+        
+        return enhanced_data, pca_features, price_labels
+
+    def calculate_time_weighted_sentiment(self, 
+                                          data: List[Dict[str, Any]],
+                                          time_window: str = 'hour',
+                                          half_life_hours: float = 24.0) -> Dict[str, float]:
+        """
+        计算时间加权情绪分数（按时间窗口聚合）
+        
+        Args:
+            data: 包含 sentiment_probabilities 和 timestamp 的数据
+            time_window: 'hour' 或 'day'
+            half_life_hours: 时间衰减半衰期
+            
+        Returns:
+            按时间窗口聚合的情绪分数
+        """
+        time_bins = {}
+        
+        for item in data:
+            timestamp = self._parse_timestamp(item.get('timestamp', ''))
+            sentiment_prob = item.get('sentiment_probabilities', {})
+            pos_prob = sentiment_prob.get('positive', 0.5)
+            neg_prob = sentiment_prob.get('negative', 0.5)
+            
+            # 确定时间窗口键
+            if time_window == 'hour':
+                window_key = timestamp.strftime('%Y-%m-%d %H:00:00')
+            else:  # day
+                window_key = timestamp.strftime('%Y-%m-%d')
+            
+            # 计算时间衰减权重（以当前时间为参考）
+            weight = self._time_decay_weight(timestamp, datetime.now(timezone.utc), half_life_hours)
+            
+            # 加权情绪值
+            sentiment_value = (pos_prob - neg_prob) * weight
+            influence = item.get('influence_score', 1.0)
+            
+            if window_key not in time_bins:
+                time_bins[window_key] = {'sum': 0.0, 'weight_sum': 0.0}
+            
+            time_bins[window_key]['sum'] += sentiment_value * influence
+            time_bins[window_key]['weight_sum'] += influence
+        
+        # 归一化
+        result = {}
+        for window, values in time_bins.items():
+            if values['weight_sum'] > 0:
+                result[window] = values['sum'] / values['weight_sum']
+            else:
+                result[window] = 0.0
+        
+        return result
+
+    def get_feature_importance_report(self) -> Dict[str, Any]:
+        """获取特征重要性报告（基于 PCA 方差解释）"""
+        if self.pca is None:
+            return {'error': 'PCA not fitted yet'}
+        
+        return {
+            'n_components': self.pca.n_components,
+            'explained_variance_ratio': self.pca.explained_variance_ratio_.tolist(),
+            'cumulative_explained_variance': np.cumsum(self.pca.explained_variance_ratio_).tolist(),
+            'components': self.pca.components_.tolist()
+        }
+
 if __name__ == "__main__":
     cleaner = DataCleaner()
     cleaner.clean_all()
+    
+    # 示例：高级特征工程
+    twitter_data = load_from_json(f"{Config.RAW_DATA_DIR}/twitter_tweets_*.json")
+    if twitter_data:
+        cleaned = cleaner.clean_twitter_data(twitter_data)
+        enhanced, pca_features, price_labels = cleaner.advanced_feature_engineering(cleaned)
+        save_to_json(enhanced, f"{Config.CLEANED_DATA_DIR}/enhanced_twitter_{datetime.now(timezone.utc).strftime('%Y%m%d')}.json")
+        logger.info(f"Advanced feature engineering completed: {len(enhanced)} records")

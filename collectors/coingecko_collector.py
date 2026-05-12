@@ -81,23 +81,42 @@ class CoinGeckoCollector:
         logger.info(f"Fetching info for coin: {coin_id}")
         data = self._make_request(f'coins/{coin_id}')
         
-        if not data:
+        if not data or isinstance(data, str):
             return {}
 
-        return {
+        result = {
             'id': data.get('id', ''),
             'symbol': data.get('symbol', '').upper(),
             'name': data.get('name', ''),
-            'description': data.get('description', {}).get('en', ''),
-            'homepage': data.get('links', {}).get('homepage', [''])[0],
-            'whitepaper': data.get('links', {}).get('whitepaper', {}).get('en', ''),
-            'twitter': data.get('links', {}).get('twitter_screen_name', ''),
-            'reddit': data.get('links', {}).get('subreddit_url', ''),
-            'market_cap_rank': data.get('market_cap_rank', 0),
-            'categories': data.get('categories', []),
             'data_source': 'coingecko',
             'scraped_at': datetime.now(timezone.utc).isoformat()
         }
+        
+        # 处理 description
+        description = data.get('description', {})
+        if isinstance(description, dict):
+            result['description'] = description.get('en', '')
+        elif isinstance(description, str):
+            result['description'] = description
+        
+        # 处理 links
+        links = data.get('links', {})
+        if isinstance(links, dict):
+            result['homepage'] = links.get('homepage', [''])[0] if isinstance(links.get('homepage'), list) else ''
+            
+            whitepaper = links.get('whitepaper', {})
+            if isinstance(whitepaper, dict):
+                result['whitepaper'] = whitepaper.get('en', '')
+            else:
+                result['whitepaper'] = ''
+            
+            result['twitter'] = links.get('twitter_screen_name', '')
+            result['reddit'] = links.get('subreddit_url', '')
+        
+        result['market_cap_rank'] = data.get('market_cap_rank', 0)
+        result['categories'] = data.get('categories', [])
+        
+        return result
 
     def get_coin_ohlc(self, coin_id: str, vs_currency: str = 'usd', days: int = 7) -> List[Dict[str, Any]]:
         logger.info(f"Fetching OHLC data for {coin_id} ({days} days)")
